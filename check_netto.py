@@ -58,8 +58,22 @@ SHOPS = [
         "name": "Rossmann",
         "listings": [
             "https://www.rossmann.de/de/search/?text=pokemon&pageSize=100",
-            "https://www.rossmann.de/de/search?text=pokemon",
             "https://www.rossmann.de/de/alle-marken/amigo/c/online-dachmarke_5549699?pageSize=100",
+        ],
+        # Zusätzlich: bekannte Pokémon-Produktseiten direkt prüfen (zuverlässig,
+        # da die Rossmann-Suche per JavaScript lädt). Hier einfach weitere
+        # Produkt-Links ergänzen, um mehr Artikel zu beobachten.
+        "product_urls": [
+            "https://www.rossmann.de/de/baby-und-spielzeug-amigo-pokemon-sammelkartenspiel-ex-kampfdeck/p/4007396203172",
+            "https://www.rossmann.de/de/baby-und-spielzeug-amigo-pokemon-booster-nr-1/p/0820650250170",
+            "https://www.rossmann.de/de/baby-und-spielzeug-amigo-pokemon-sammelkartenspiel-kundp-top-trainer-box/p/4007396203127",
+            "https://www.rossmann.de/de/baby-und-spielzeug-amigo-pokemon-v-box/p/4007396203059",
+            "https://www.rossmann.de/de/baby-und-spielzeug-amigo-pokemon-v-box/p/0820650458682",
+            "https://www.rossmann.de/de/baby-und-spielzeug-amigo-pokemon-sammelkartenspiel-super-premium-kollektion-glurak-ex/p/0820650459023",
+            "https://www.rossmann.de/de/ideenwelt-amigo-pokemon-tcg-mini-tin/p/4007396203073",
+            "https://www.rossmann.de/de/baby-und-spielzeug-amigo-pokemon-sammelkartenspiel-liga-kampfdeck-ur-palkia-vstar/p/0820650455049",
+            "https://www.rossmann.de/de/ideenwelt-ideenwelt-pokemon-sammelkartenspiel-deluxe-kampfdeck/p/0820650455162",
+            "https://www.rossmann.de/de/baby-und-spielzeug-amigo-pokemon-sammelkartenspiel-mein-erstes-spiel/p/0820650455131",
         ],
         "product_re": re.compile(
             r"https://www\.rossmann\.de/de/([a-z0-9\-]+)/p/(\d+)", re.I),
@@ -217,6 +231,15 @@ def process_shop(shop, state):
             print(f"[Diagnose] {shop['name']} sieht nach Sperre/Bot-Schutz aus "
                   "(evtl. GitHub-IP blockiert).", file=sys.stderr)
         products.update(pk)
+
+    # Zusätzlich fest hinterlegte Produkt-URLs aufnehmen
+    for u in shop.get("product_urls", []):
+        m = shop["product_re"].search(u)
+        if m:
+            products.setdefault(m.group(2), m.group(1))
+    if shop.get("product_urls"):
+        print(f"[Diagnose] {len(shop['product_urls'])} feste Produktseiten ergänzt "
+              f"→ {len(products)} Pokémon-Artikel gesamt.")
 
     if not products:
         print(f"Keine Pokémon-Produkte bei {shop['name']} – Zustand unverändert.",
