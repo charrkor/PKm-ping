@@ -1,4 +1,4 @@
-!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 Netto Pokémon Verfügbarkeits-Tracker
 ------------------------------------
@@ -14,11 +14,13 @@ Konfiguration über Umgebungsvariablen:
   STATE_FILE   (optional)  Standard: state.json
 """
 
+import gzip
 import json
 import os
 import re
 import sys
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -34,58 +36,76 @@ STATE_FILE = Path(os.environ.get("STATE_FILE") or "state.json")
 CATEGORY_URLS = [
     "https://www.netto-online.de/sammelkarten/c-N06081404",
 ]
-
-# Link, der in der "Tracker aktiv"-Info-Nachricht geöffnet wird
 CATEGORY_LINK = "https://www.netto-online.de/sammelkarten/c-N06081404"
 
 # ---------------------------------------------------------------------------
 # Erkennungs-Muster
 # ---------------------------------------------------------------------------
-# Produkt-Links auf netto-online.de sehen so aus:  /<slug>/p-<zahl>
 PRODUCT_RE = re.compile(r"https://www\.netto-online\.de/([a-z0-9\-]+)/p-(\d+)", re.I)
-# Pokémon erkennt man am Slug: "pok-mon-...", "pokemon-...", "pokémon-..."
-POKEMON_RE = re.compile(r"pok[\-eé]?mon", re.I)
-# Eindeutiger Ausverkauft-Marker auf der Produktseite
+POKEMON_RE = re.compile(r"pok[\-e\u00e9]?mon", re.I)  # pok-mon / pokemon / pokémon
 SOLD_OUT_RE = re.compile(r"aktuell ausverkauft", re.I)
 
+# Anzeichen für eine Sperr-/Consent-/Bot-Seite (falls Netto die IP abweist)
+BLOCK_HINTS = ("captcha", "access denied", "zugriff verweigert", "just a moment",
+               "cloudflare", "are you a robot", "bot detection", "forbidden")
+
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+
+
+# ---------------------------------------------------------------------------
+# Netzwerk
+# ---------------------------------------------------------------------------
+def fetch(url, timeout=30, attempts=3):
+    """Lädt eine Seite (mit Wiederholversuchen) und gibt HTML-Text zurück."""
+    headers = {
+        "User-Agent": UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
+        "Referer": "https://www.netto-online.de/",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-User": "?1",
+    }
+    last_err = None
+    for i in range(1, attempts + 1):
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                raw = r.read()
+                enc = (r.headers.get("Content-Encoding") or "").lower()
+                status = getattr(r, "status", 200)
+            if "gzip" in enc:
+                raw = gzip.decompress(raw)
+            text = raw.decode("utf-8", errors="replace")
+            print(f"  [ok] HTTP {status}, {len(text)} Zeichen (Versuch {i})")
+            return text
+        except urllib.error.HTTPError as e:
+            last_err = f"HTTP {e.code}"
+            print(f"  [!] Versuch {i}: {last_err} bei {url}", file=sys.stderr)
+        except Exception as e:
+            last_err = str(e)
+            print(f"  [!] Versuch {i}: {last_err} bei {url}", file=sys.stderr)
+        time.sleep(2 * i)
+    raise RuntimeError(last_err or "unbekannter Fehler")
 
 
 # ---------------------------------------------------------------------------
 # Hilfsfunktionen
 # ---------------------------------------------------------------------------
-def fetch(url, timeout=30):
-    """Lädt eine Seite und gibt den HTML-Text zurück."""
-    req = urllib.request.Request(url, headers={
-        "User-Agent": UA,
-        "Accept-Language": "de-DE,de;q=0.9",
-        "Accept": "text/html,application/xhtml+xml",
-    })
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        raw = r.read()
-    try:
-        return raw.decode("utf-8")
-    except UnicodeDecodeError:
-        return raw.decode("latin-1", errors="replace")
-
-
 def slug_to_name(slug):
-    """Macht aus einem URL-Slug einen lesbaren Produktnamen."""
     name = slug.replace("-", " ")
-    name = re.sub(r"\bpokemon\b", "Pokémon", name, flags=re.I)
-    name = re.sub(r"\bpok mon\b", "Pokémon", name, flags=re.I)
-    # doppeltes "Pokémon Pokémon" entfernen
-    name = re.sub(r"(Pokémon)(\s+Pokémon)+", r"\1", name)
+    name = re.sub(r"\bpokemon\b", "Pok\u00e9mon", name, flags=re.I)
+    name = re.sub(r"\bpok mon\b", "Pok\u00e9mon", name, flags=re.I)
+    name = re.sub(r"(Pok\u00e9mon)(\s+Pok\u00e9mon)+", r"\1", name)
     name = re.sub(r"\s+", " ", name).strip()
-    words = []
-    for w in name.split():
-        words.append(w if w == "Pokémon" else w.capitalize())
-    return " ".join(words)
+    return " ".join(w if w == "Pok\u00e9mon" else w.capitalize() for w in name.split())
 
 
 def find_pokemon_products(html):
-    """Findet alle Pokémon-Produkte auf einer Seite. Rückgabe: {sku: slug}."""
+    """{sku: slug} aller Pokémon-Produkte auf einer Seite."""
     found = {}
     for m in PRODUCT_RE.finditer(html):
         slug, sku = m.group(1), m.group(2)
@@ -94,12 +114,17 @@ def find_pokemon_products(html):
     return found
 
 
+def count_all_products(html):
+    return len(set(m.group(2) for m in PRODUCT_RE.finditer(html)))
+
+
+def looks_blocked(html):
+    low = html.lower()
+    return any(w in low for w in BLOCK_HINTS)
+
+
 def is_buyable(url):
-    """
-    True  = Produkt ist kaufbar
-    False = ausverkauft
-    None  = konnte nicht geprüft werden (Netzwerkfehler)
-    """
+    """True = kaufbar, False = ausverkauft, None = nicht prüfbar."""
     try:
         html = fetch(url)
     except Exception as e:
@@ -109,7 +134,6 @@ def is_buyable(url):
 
 
 def notify(title, message, click_url=None, tags=None, priority=5):
-    """Schickt eine Push-Nachricht über ntfy (JSON-Format, UTF-8-sicher)."""
     if not NTFY_TOPIC:
         print("!! NTFY_TOPIC nicht gesetzt – keine Benachrichtigung", file=sys.stderr)
         return
@@ -134,12 +158,11 @@ def notify(title, message, click_url=None, tags=None, priority=5):
 
 
 def load_state():
-    """Lädt den gespeicherten Zustand. Rückgabe: (state, had_state)."""
     if STATE_FILE.exists():
         try:
             return json.loads(STATE_FILE.read_text("utf-8")), True
         except Exception:
-            return {}, True  # kaputte Datei -> als vorhanden behandeln, kein Spam
+            return {}, True
     return {}, False
 
 
@@ -152,20 +175,36 @@ def save_state(state):
 # ---------------------------------------------------------------------------
 def main():
     state, had_state = load_state()
-    # state-Schema:  { sku: {"slug": str, "buyable": bool, "last_seen": int} }
-
     products = {}
+    saw_block = False
+
     for url in CATEGORY_URLS:
+        print(f"Lade Kategorie: {url}")
         try:
-            products.update(find_pokemon_products(fetch(url)))
+            html = fetch(url)
         except Exception as e:
-            print(f"! Kategorie-Seite Fehler ({url}): {e}", file=sys.stderr)
+            print(f"! Kategorie nicht ladbar: {e}", file=sys.stderr)
+            continue
+        total = count_all_products(html)
+        pk = find_pokemon_products(html)
+        print(f"[Diagnose] {total} Produktlinks insgesamt, {len(pk)} davon Pokémon.")
+        if total == 0 and looks_blocked(html):
+            saw_block = True
+            print("[Diagnose] Seite sieht nach Sperre/Bot-Schutz aus – Netto blockt "
+                  "vermutlich die GitHub-Server-IP.", file=sys.stderr)
+        elif total == 0:
+            print("[Diagnose] Keine Produktlinks – evtl. Consent-Seite oder geänderte "
+                  "Struktur. Erste 300 Zeichen:", file=sys.stderr)
+            print("   " + " ".join(html[:300].split()), file=sys.stderr)
+        products.update(pk)
 
     if not products:
-        # Nichts gefunden -> Seite evtl. geändert. Zustand NICHT überschreiben,
-        # damit es keinen Fehlalarm beim nächsten Lauf gibt.
-        print("Keine Pokémon-Produkte gefunden (Seitenstruktur geändert?).",
-              file=sys.stderr)
+        print("Keine Pokémon-Produkte gefunden – Zustand wird NICHT verändert.", file=sys.stderr)
+        if saw_block and not had_state:
+            notify("⚠️ Netto-Tracker: Zugriff geblockt",
+                   "Netto scheint die GitHub-IP zu sperren. Sag Claude Bescheid – "
+                   "wir stellen dann auf eine andere Methode um.",
+                   tags=["warning"], priority=4)
         return 1
 
     now = int(time.time())
@@ -176,50 +215,40 @@ def main():
         url = f"https://www.netto-online.de/{slug}/p-{sku}"
         prev = state.get(sku)
         was_buyable = bool(prev and prev.get("buyable"))
-
         if was_buyable:
-            # schon als kaufbar bekannt -> nur Zeitstempel auffrischen
             state[sku] = {"slug": slug, "buyable": True, "last_seen": now}
             continue
-
-        # neu ODER vorher ausverkauft -> auf der Produktseite gegenprüfen
         buyable = is_buyable(url)
         if buyable is None:
             if prev is None:
                 state[sku] = {"slug": slug, "buyable": False, "last_seen": now}
             continue
-
         state[sku] = {"slug": slug, "buyable": buyable, "last_seen": now}
         if buyable and not was_buyable:
             newly_available.append((sku, slug, url))
-        time.sleep(1)  # fair zu Nettos Servern
+        time.sleep(1)
 
-    # Artikel, die nicht mehr gelistet sind -> als nicht kaufbar markieren
     for sku in list(state.keys()):
         if sku not in listed and state[sku].get("buyable"):
             state[sku]["buyable"] = False
 
     save_state(state)
 
-    # Erstlauf: kein Spam, nur eine kurze Bestätigung
     if not had_state:
         anzahl = sum(1 for s in products if state[s].get("buyable"))
         notify("✅ Netto-Pokémon-Tracker aktiv",
                f"Ich beobachte jetzt die Sammelkarten-Kategorie. "
                f"Aktuell kaufbar: {anzahl} Pokémon-Artikel.",
                click_url=CATEGORY_LINK, tags=["white_check_mark"], priority=3)
-        print(f"Erstlauf ok. {len(products)} Pokémon-Artikel erfasst, "
-              f"{anzahl} davon kaufbar.")
+        print(f"Erstlauf ok. {len(products)} Pokémon-Artikel, {anzahl} kaufbar.")
         return 0
 
     for sku, slug, url in newly_available:
-        name = slug_to_name(slug)
         notify("🔴 Pokémon bei Netto kaufbar!",
-               f"{name}\nJetzt im Netto Online-Shop verfügbar – schnell sein!",
+               f"{slug_to_name(slug)}\nJetzt im Netto Online-Shop verfügbar – schnell sein!",
                click_url=url, tags=["rotating_light"], priority=5)
 
-    print(f"Fertig. {len(products)} Pokémon-Artikel geprüft, "
-          f"{len(newly_available)} neu verfügbar.")
+    print(f"Fertig. {len(products)} Pokémon-Artikel, {len(newly_available)} neu verfügbar.")
     return 0
 
 
